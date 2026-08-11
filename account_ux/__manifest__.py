@@ -29,7 +29,6 @@
     "images": [],
     "depends": [
         "account",
-        "sale",
         "base_vat",
         "account_debit_note",
     ],
