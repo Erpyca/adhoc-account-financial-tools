@@ -7,7 +7,16 @@
         <xpath expr="//table[@name='invoices']" position="inside">
             <t t-if="not any(inv.currency_id != o.currency_id and inv.currency_id != o.company_id.currency_id for inv in invoices)" t-set="otherCurrency" t-value="False"/>
         </xpath>
-        <xpath expr="//div[@name='payment_method']//span[@t-field='o.payment_method_id.name']" position="attributes">
+        <!-- No filtrar este xpath por el t-field del span (ej [@t-field='o.payment_method_id.name']).
+             El fix opw-6395829 / odoo/odoo#277104 cambia, en el nucleo, el atributo t-field de
+             ese span de o.payment_method_id.name a o.payment_method_line_id.name. En 18.0 el
+             nucleo todavia no trae ese cambio, pero si en algun momento se backportea, un xpath
+             que exija el t-field viejo deja de matchear y rompe la instalacion/actualizacion de
+             cualquier modulo ("Element ... cannot be located in parent view"). Por eso el xpath
+             apunta solo al span del bloque payment_method: el bloque tiene un unico span en
+             cualquiera de los dos escenarios, y el atributo queda idempotente si el nucleo ya
+             trae el cambio. -->
+        <xpath expr="//div[@name='payment_method']//span" position="attributes">
             <attribute name="t-field">o.payment_method_line_id.name</attribute>
         </xpath>
     </template>
