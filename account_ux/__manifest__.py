@@ -19,7 +19,7 @@
 ##############################################################################
 {
     "name": "Account UX",
-    "version": "19.0.1.22.0",
+    "version": "19.0.1.29.0",
     "category": "Accounting",
     "sequence": 14,
     "summary": "",
@@ -36,6 +36,7 @@
         "security/account_ux_security.xml",
         "security/ir.model.access.csv",
         "data/mail_template_data.xml",
+        "data/ir_config_parameter_data.xml",
         "data/account_automatic_entry_actions.xml",
         "wizards/account_change_currency_views.xml",
         "wizards/res_config_settings_views.xml",
@@ -49,8 +50,10 @@
         "views/account_move_views.xml",
         "views/account_payment_views.xml",
         "views/res_config_settings_views.xml",
+        "views/res_currency_views.xml",
         "views/report_payment_receipt_templates.xml",
         "views/account_tax_view.xml",
+        "views/res_company_views.xml",
         "reports/account_invoice_report_view.xml",
         "wizards/account_automatic_entry_wizard_views.xml",
     ],
