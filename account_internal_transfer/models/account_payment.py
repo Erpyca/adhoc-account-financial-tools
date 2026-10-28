@@ -13,8 +13,24 @@ class AccountPayment(models.Model):
     destination_journal_id = fields.Many2one(
         comodel_name="account.journal",
         string="Destination Journal",
-        domain="[('type', 'in', ('bank','cash','credit')), ('id', '!=', journal_id),('company_id', 'child_of', main_company_id)]",
+        domain="[('type', 'in', ('bank','cash','credit')), ('id', '!=', journal_id),('company_id', 'child_of', main_company_id),('active', '=', True)]",
         check_company=False,
+    )
+    destination_payment_method_line_id = fields.Many2one(
+        comodel_name="account.payment.method.line",
+        string="Destination Journal Payment Method",
+        compute="_compute_destination_payment_method_line_id",
+        store=True,
+        readonly=False,
+        copy=False,
+        # the destination journal may belong to another branch
+        check_company=False,
+        help="Payment method line used on the paired payment created in the destination journal. "
+        "It determines the outstanding account of that payment.",
+    )
+    available_destination_payment_method_line_ids = fields.Many2many(
+        comodel_name="account.payment.method.line",
+        compute="_compute_available_destination_payment_method_line_ids",
     )
     main_company_id = fields.Many2one(
         "res.company",
@@ -26,6 +42,43 @@ class AccountPayment(models.Model):
     def _compute_main_company(self):
         for rec in self:
             rec.main_company_id = rec.company_id.parent_id or rec.company_id
+
+    def _get_paired_payment_type(self):
+        """Payment type of the paired payment created in the destination journal."""
+        self.ensure_one()
+        return "inbound" if self.payment_type == "outbound" else "outbound"
+
+    @api.depends("destination_journal_id", "payment_type", "is_internal_transfer")
+    def _compute_available_destination_payment_method_line_ids(self):
+        for pay in self:
+            journal = pay.destination_journal_id
+            if pay.is_internal_transfer and journal:
+                pay.available_destination_payment_method_line_ids = journal._get_available_payment_method_lines(
+                    pay._get_paired_payment_type()
+                )
+            else:
+                pay.available_destination_payment_method_line_ids = False
+
+    @api.depends("available_destination_payment_method_line_ids")
+    def _compute_destination_payment_method_line_id(self):
+        for pay in self:
+            available_lines = pay.available_destination_payment_method_line_ids
+            # an explicit choice is kept as long as it is still available on the destination journal
+            if pay.destination_payment_method_line_id in available_lines:
+                continue
+            pay.destination_payment_method_line_id = available_lines[:1]
+
+    @api.constrains("destination_payment_method_line_id", "destination_journal_id")
+    def _check_destination_payment_method_line_id(self):
+        for pay in self.filtered("destination_payment_method_line_id"):
+            if pay.destination_payment_method_line_id not in pay.available_destination_payment_method_line_ids:
+                raise ValidationError(
+                    _(
+                        "The destination payment method %(method)s is not available on the destination journal %(journal)s.",
+                        method=pay.destination_payment_method_line_id.display_name,
+                        journal=pay.destination_journal_id.display_name,
+                    )
+                )
 
     # TO DO: Check in v19+ if odoo delete the paired_internal_transfer_payment_id field, restore the field in this module
     # paired_internal_transfer_payment_id = fields.Many2one('account.payment',
@@ -95,26 +148,33 @@ class AccountPayment(models.Model):
                 )
             )
         for payment in self:
-            paired_payment_type = "inbound" if payment.payment_type == "outbound" else "outbound"
+            paired_payment_type = payment._get_paired_payment_type()
+            # the line chosen by the user wins over the journal default and over the context hook
+            destination_line = payment.destination_payment_method_line_id
+            paired_method_line = (
+                destination_line
+                or payment.destination_journal_id._get_available_payment_method_lines(paired_payment_type)[:1]
+            )
             paired_payment = payment.copy(
                 {
                     "journal_id": payment.destination_journal_id.id,
                     "company_id": payment.destination_journal_id.company_id.id,
                     "destination_journal_id": payment.journal_id.id,
                     "payment_type": paired_payment_type,
-                    "payment_method_line_id": payment.destination_journal_id._get_available_payment_method_lines(
-                        paired_payment_type
-                    )[:1].id,
+                    "payment_method_line_id": paired_method_line.id,
+                    # copy() carries the origin account when the field is editable (l10n_account_withholding_tax)
+                    "outstanding_account_id": paired_method_line.payment_account_id.id,
                     "move_id": None,
                     "memo": payment.memo,
                     "paired_internal_transfer_payment_id": payment.id,
                     "date": payment.date,
                 }
             )
-            # The payment method line ID in 'paired_payment' needs to be computed manually,
-            # as it does not compute automatically.
-            # This ensures not to use the same payment method line ID of the original transfer payment.
-            paired_payment._compute_payment_method_line_id()
+            if not destination_line:
+                # The payment method line ID in 'paired_payment' needs to be computed manually,
+                # as it does not compute automatically.
+                # This ensures not to use the same payment method line ID of the original transfer payment.
+                paired_payment._compute_payment_method_line_id()
             if (
                 not payment.payment_method_line_id.payment_account_id
                 or not paired_payment.payment_method_line_id.payment_account_id
@@ -123,7 +183,7 @@ class AccountPayment(models.Model):
                     _("The origin or destination payment methods do not have an outstanding account.")
                 )
 
-            if self.env.context.get("default_payment_method_line_id"):
+            if not destination_line and self.env.context.get("default_payment_method_line_id"):
                 paired_payment.payment_method_line_id = self.env.context.get("default_payment_method_line_id")
             paired_payment.filtered(lambda p: not p.move_id)._generate_journal_entry()
             paired_payment.move_id._post(soft=False)
@@ -132,17 +192,45 @@ class AccountPayment(models.Model):
             paired_payment.message_post(body=body)
             body = _("A second payment has been created:") + paired_payment._get_html_link()
             payment.message_post(body=body)
+            payment._reconcile_paired_transfer_lines()
 
+    def _reconcile_paired_transfer_lines(self):
+        """Reconcile the transfer account lines of each payment with the ones of its paired payment.
+
+        Resetting a leg to draft unreconciles those lines, so this runs on every confirmation and
+        not only when the pair is created. Nothing happens while the other leg is not posted: the
+        last leg confirmed reconciles the pair.
+        """
+        for payment in self:
+            paired_payment = payment.paired_internal_transfer_payment_id
+            # Both legs may be posted in the same batch: the first one posted finds the other
+            # still in draft and skips, the second one reconciles the pair.
+            if payment.move_id.state != "posted" or paired_payment.move_id.state != "posted":
+                continue
             lines = (payment.move_id.line_ids + paired_payment.move_id.line_ids).filtered(
                 lambda l: (l.account_id == payment.destination_account_id and not l.reconciled)
             )
-            lines.reconcile()
+            # A single open line has no counterpart here: the other one was reconciled by hand
+            # with something else while this leg was in draft, and reconcile() would run for nothing.
+            if len(lines) > 1:
+                lines.reconcile()
 
     def action_post(self):
+        # A transfer already posted before and without a pair comes from older data, where the destination
+        # entry has no payment of its own: creating the pair now would register that entry twice.
+        unpaired_reposted = self.filtered(
+            lambda pay: (
+                pay.is_internal_transfer and not pay.paired_internal_transfer_payment_id and pay.move_id.posted_before
+            )
+        )
         super().action_post()
-        self.filtered(
-            lambda pay: (pay.is_internal_transfer and not pay.paired_internal_transfer_payment_id)
+        transfers = self.filtered("is_internal_transfer")
+        (transfers - unpaired_reposted).filtered(
+            lambda pay: not pay.paired_internal_transfer_payment_id
         )._create_paired_internal_transfer_payment()
+        # A leg reset to draft and confirmed again already has its pair: only the reconciliation
+        # of the transfer lines is missing, since the reset to draft removed it.
+        transfers.filtered("paired_internal_transfer_payment_id")._reconcile_paired_transfer_lines()
 
     def action_open_destination_journal(self):
         """Redirect the user to this destination journal.
